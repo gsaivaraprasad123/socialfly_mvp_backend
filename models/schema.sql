@@ -12,12 +12,17 @@ CREATE TABLE IF NOT EXISTS instagram_accounts (
   id SERIAL PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   instagram_business_account_id VARCHAR(255) NOT NULL,
-  access_token_encrypted TEXT NOT NULL,
+
+  user_access_token_encrypted TEXT NOT NULL,
+  page_access_token_encrypted TEXT NOT NULL,
+
   token_expires_at TIMESTAMP,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
   UNIQUE(user_id, instagram_business_account_id)
 );
+
 
 -- Create posts table
 CREATE TABLE IF NOT EXISTS posts (
