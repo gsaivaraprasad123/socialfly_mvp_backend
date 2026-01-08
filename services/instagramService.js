@@ -1,130 +1,170 @@
 import axios from 'axios';
-import { decrypt } from '../utils/encryption.js';
 import pool from '../config/database.js';
+import { decrypt } from '../utils/encryption.js';
 
-const INSTAGRAM_API_BASE = 'https://graph.facebook.com/v18.0';
+const GRAPH_BASE = 'https://graph.facebook.com/v24.0';
 
-// Get decrypted access token for an Instagram account
-const getAccessToken = async (instagramAccountId) => {
-  const result = await pool.query(
-    'SELECT access_token_encrypted FROM instagram_accounts WHERE id = $1',
+/**
+ * Fetch IG business account + PAGE token
+ */
+const getInstagramAccount = async (instagramAccountId) => {
+  const res = await pool.query(
+    `
+    SELECT
+      instagram_business_account_id,
+      page_access_token_encrypted
+    FROM instagram_accounts
+    WHERE id = $1
+    `,
     [instagramAccountId]
   );
 
-  if (result.rows.length === 0) {
+  if (res.rows.length === 0) {
     throw new Error('Instagram account not found');
   }
 
-  return decrypt(result.rows[0].access_token_encrypted);
+  return {
+    igId: res.rows[0].instagram_business_account_id,
+    pageToken: decrypt(res.rows[0].page_access_token_encrypted),
+  };
 };
 
-// Upload media to Instagram
-export const uploadMedia = async (instagramAccountId, mediaUrl, mediaType = 'IMAGE') => {
-  try {
-    const accessToken = await getAccessToken(instagramAccountId);
-    
-    const accountResult = await pool.query(
-      'SELECT instagram_business_account_id FROM instagram_accounts WHERE id = $1',
-      [instagramAccountId]
-    );
+/**
+ * Create media container (image or video)
+ */
+const createMediaContainer = async ({
+  igId,
+  pageToken,
+  mediaUrl,
+  caption,
+  mediaType = 'IMAGE',
+  isCarouselItem = false,
+  altText,
+}) => {
+  const payload = {
+    access_token: pageToken,
+    caption,
+    is_carousel_item: isCarouselItem || undefined,
+  };
 
-    const businessAccountId = accountResult.rows[0].instagram_business_account_id;
-
-    // Step 1: Create media container
-    const containerResponse = await axios.post(
-      `${INSTAGRAM_API_BASE}/${businessAccountId}/media`,
-      {
-        image_url: mediaUrl,
-        caption: '', // Will be added in publish step
-        access_token: accessToken,
-      }
-    );
-
-    const creationId = containerResponse.data.id;
-
-    // Step 2: Publish the media
-    const publishResponse = await axios.post(
-      `${INSTAGRAM_API_BASE}/${businessAccountId}/media_publish`,
-      {
-        creation_id: creationId,
-        access_token: accessToken,
-      }
-    );
-
-    return publishResponse.data.id; // Instagram post ID
-  } catch (error) {
-    console.error('Instagram media upload error:', error.response?.data || error.message);
-    throw error;
+  if (mediaType === 'IMAGE') {
+    payload.image_url = mediaUrl;
+    if (altText) payload.alt_text = altText;
+  } else {
+    payload.video_url = mediaUrl;
+    payload.media_type = mediaType; // VIDEO | REELS | STORIES
   }
+
+  const res = await axios.post(
+    `${GRAPH_BASE}/${igId}/media`,
+    payload
+  );
+
+  return res.data.id;
 };
 
-// Publish post with caption
-export const publishPost = async (instagramAccountId, mediaUrl, caption) => {
-  try {
-    const accessToken = await getAccessToken(instagramAccountId);
-    
-    const accountResult = await pool.query(
-      'SELECT instagram_business_account_id FROM instagram_accounts WHERE id = $1',
-      [instagramAccountId]
-    );
+/**
+ * Create carousel container
+ */
+const createCarouselContainer = async ({
+  igId,
+  pageToken,
+  caption,
+  childrenIds,
+}) => {
+  const res = await axios.post(
+    `${GRAPH_BASE}/${igId}/media`,
+    {
+      media_type: 'CAROUSEL',
+      caption,
+      children: childrenIds.join(','),
+      access_token: pageToken,
+    }
+  );
 
-    const businessAccountId = accountResult.rows[0].instagram_business_account_id;
+  return res.data.id;
+};
 
-    // Step 1: Create media container with caption
-    const containerResponse = await axios.post(
-      `${INSTAGRAM_API_BASE}/${businessAccountId}/media`,
-      {
-        image_url: mediaUrl,
-        caption: caption || '',
-        access_token: accessToken,
-      }
-    );
+/**
+ * Publish container
+ */
+const publishContainer = async ({ igId, pageToken, containerId }) => {
+  const res = await axios.post(
+    `${GRAPH_BASE}/${igId}/media_publish`,
+    {
+      creation_id: containerId,
+      access_token: pageToken,
+    }
+  );
 
-    const creationId = containerResponse.data.id;
+  return res.data.id;
+};
 
-    // Step 2: Publish the media
-    const publishResponse = await axios.post(
-      `${INSTAGRAM_API_BASE}/${businessAccountId}/media_publish`,
-      {
-        creation_id: creationId,
-        access_token: accessToken,
-      }
-    );
+/**
+ * PUBLIC: Publish Post (used by controller + cron)
+ */
+export const publishPost = async (
+  instagramAccountId,
+  mediaUrl,
+  caption,
+  options = {}
+) => {
+  const { igId, pageToken } =
+    await getInstagramAccount(instagramAccountId);
 
-    return publishResponse.data.id; // Instagram post ID
-  } catch (error) {
-    console.error('Instagram publish error:', error.response?.data || error.message);
-    throw error;
+  // Rate-limit check (optional but recommended)
+  const limitRes = await axios.get(
+    `${GRAPH_BASE}/${igId}/content_publishing_limit`,
+    { params: { access_token: pageToken } }
+  );
+
+  if (limitRes.data.data?.[0]?.quota_usage >= 100) {
+    throw new Error('Instagram publishing rate limit exceeded');
   }
-};
 
-// Validate and refresh token if needed
-export const validateToken = async (instagramAccountId) => {
-  try {
-    const accessToken = await getAccessToken(instagramAccountId);
-    
-    // Check token validity by making a simple API call
-    const accountResult = await pool.query(
-      'SELECT instagram_business_account_id FROM instagram_accounts WHERE id = $1',
-      [instagramAccountId]
-    );
+  let containerId;
 
-    const businessAccountId = accountResult.rows[0].instagram_business_account_id;
-
-    await axios.get(
-      `${INSTAGRAM_API_BASE}/${businessAccountId}`,
-      {
-        params: {
-          fields: 'id,username',
-          access_token: accessToken,
-        },
-      }
-    );
-
-    return true;
-  } catch (error) {
-    console.error('Token validation error:', error.response?.data || error.message);
-    return false;
+  // SINGLE IMAGE / VIDEO
+  if (!Array.isArray(mediaUrl)) {
+    containerId = await createMediaContainer({
+      igId,
+      pageToken,
+      mediaUrl,
+      caption,
+      mediaType: options.mediaType || 'IMAGE',
+      altText: options.altText,
+    });
   }
-};
+  // CAROUSEL
+  else {
+    if (mediaUrl.length > 10) {
+      throw new Error('Carousel supports max 10 items');
+    }
 
+    const childContainers = [];
+    for (const url of mediaUrl) {
+      const childId = await createMediaContainer({
+        igId,
+        pageToken,
+        mediaUrl: url,
+        caption: null,
+        isCarouselItem: true,
+      });
+      childContainers.push(childId);
+    }
+
+    containerId = await createCarouselContainer({
+      igId,
+      pageToken,
+      caption,
+      childrenIds: childContainers,
+    });
+  }
+
+  // Publish
+  return await publishContainer({
+    igId,
+    pageToken,
+    containerId,
+  });
+};
