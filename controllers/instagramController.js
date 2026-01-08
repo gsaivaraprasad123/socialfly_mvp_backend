@@ -1,107 +1,137 @@
-import pool from '../config/database.js';
-import { POST_STATUS } from '../config/constants.js';
-import { publishPost } from '../services/instagramService.js';
+import axios from "axios";
+import pool from "../config/database.js";
+import { encrypt } from "../utils/encryption.js";
 
-export const createPost = async (req, res) => {
+const GRAPH_BASE = "https://graph.facebook.com/v24.0";
+
+// /instagram/connect
+export const connect = async (req, res) => {
   try {
-    const { caption, mediaUrl, publishAt } = req.body;
     const userId = req.user.id;
 
-    if (!mediaUrl) {
-      return res.status(400).json({ error: 'Media URL is required' });
-    }
+    const params = new URLSearchParams({
+      client_id: process.env.FACEBOOK_APP_ID,
+      display: "page",
+      redirect_uri: process.env.INSTAGRAM_REDIRECT_URI,
+      response_type: "token",
+      scope: [
+        "instagram_basic",
+        "instagram_content_publish",
+        "instagram_manage_comments",
+        "instagram_manage_insights",
+        "pages_show_list",
+        "pages_read_engagement",
+      ].join(","),
 
-    const account = await pool.query(
-      'SELECT id FROM instagram_accounts WHERE user_id = $1 LIMIT 1',
-      [userId]
-    );
+      // IMPORTANT — required for IG API onboarding
+      extras: JSON.stringify({
+        setup: { channel: "IG_API_ONBOARDING" },
+      }),
 
-    if (!account.rows.length) {
-      return res.status(400).json({
-        error: 'No Instagram account connected',
-      });
-    }
+      // CSRF + user mapping
+      state: String(userId),
+    });
 
-    const status = publishAt
-      ? POST_STATUS.SCHEDULED
-      : POST_STATUS.DRAFT;
+    const authUrl = `https://www.facebook.com/v24.0/dialog/oauth?${params.toString()}`;
 
-    const result = await pool.query(
-      `
-      INSERT INTO posts
-        (user_id, instagram_account_id, caption, media_url, status, publish_at)
-      VALUES ($1,$2,$3,$4,$5,$6)
-      RETURNING *
-      `,
-      [
-        userId,
-        account.rows[0].id,
-        caption || null,
-        JSON.stringify(mediaUrl),
-        status,
-        publishAt || null,
-      ]
-    );
-
-    res.status(201).json({ post: result.rows[0] });
+    return res.json({ authUrl });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Create post failed' });
+    console.error("Instagram connect error:", err);
+    return res.status(500).json({ error: "Failed to generate login URL" });
   }
 };
 
-export const publishNow = async (req, res) => {
+ // POST /instagram/callback
+export const callback = async (req, res) => {
   try {
-    const { id } = req.params;
-    const userId = req.user.id;
+    const {
+      access_token,
+      long_lived_token,
+      expires_in,
+      state,
+    } = req.body;
 
-    const result = await pool.query(
-      `
-      SELECT p.*, ia.id AS instagram_account_id
-      FROM posts p
-      JOIN instagram_accounts ia ON ia.id = p.instagram_account_id
-      WHERE p.id = $1 AND p.user_id = $2
-      `,
-      [id, userId]
-    );
+    const userId = Number(state);
 
-    if (!result.rows.length) {
-      return res.status(404).json({ error: 'Post not found' });
+    if (!long_lived_token || !userId) {
+      return res.status(400).json({ error: "Missing token or state" });
     }
 
-    const post = result.rows[0];
+    const expiresAt = new Date(Date.now() + Number(expires_in) * 1000);
 
-    const instagramPostId = await publishPost(
-      post.instagram_account_id,
-      JSON.parse(post.media_url),
-      post.caption
+    /**
+     * STEP 4 — Get Pages + IG Business Account
+     */
+    const pagesRes = await axios.get(`${GRAPH_BASE}/me/accounts`, {
+      params: {
+        fields: "id,name,access_token,instagram_business_account",
+        access_token: long_lived_token,
+      },
+    });
+
+    const pages = pagesRes.data.data || [];
+
+    if (pages.length === 0) {
+      return res.status(400).json({
+        error: "No Facebook Pages found for this user",
+      });
+    }
+
+    /**
+     * Pick first page WITH IG business account
+     * (Later you can allow user selection)
+     */
+    const page = pages.find(
+      (p) => p.instagram_business_account?.id
     );
 
+    if (!page) {
+      return res.status(400).json({
+        error: "No Instagram Business Account linked to any Page",
+      });
+    }
+
+    const igBusinessId = page.instagram_business_account.id;
+    const pageAccessToken = page.access_token;
+
+    /**
+     * STEP 5 — UPSERT into DB (MATCHES YOUR SCHEMA)
+     */
     await pool.query(
       `
-      UPDATE posts
-      SET status = $1,
-          published_at = NOW(),
-          instagram_post_id = $2
-      WHERE id = $3
+      INSERT INTO instagram_accounts (
+        user_id,
+        instagram_business_account_id,
+        user_access_token_encrypted,
+        page_access_token_encrypted,
+        token_expires_at
+      )
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (user_id, instagram_business_account_id)
+      DO UPDATE SET
+        user_access_token_encrypted = EXCLUDED.user_access_token_encrypted,
+        page_access_token_encrypted = EXCLUDED.page_access_token_encrypted,
+        token_expires_at = EXCLUDED.token_expires_at,
+        updated_at = NOW()
       `,
-      [POST_STATUS.PUBLISHED, instagramPostId, id]
+      [
+        userId,
+        igBusinessId,
+        encrypt(long_lived_token),
+        encrypt(pageAccessToken),
+        expiresAt,
+      ]
     );
 
-    res.json({ instagramPostId });
+    return res.json({
+      message: "Instagram Business account connected",
+      instagramBusinessAccountId: igBusinessId,
+      pageId: page.id,
+      pageName: page.name,
+      tokenExpiresAt: expiresAt,
+    });
   } catch (err) {
-    const msg =
-      err.response?.data?.error?.message || err.message;
-
-    await pool.query(
-      `
-      UPDATE posts
-      SET status = $1, error_message = $2
-      WHERE id = $3
-      `,
-      [POST_STATUS.FAILED, msg, req.params.id]
-    );
-
-    res.status(500).json({ error: msg });
+    console.error("Instagram callback error:", err.response?.data || err);
+    return res.status(500).json({ error: "Instagram onboarding failed" });
   }
 };
