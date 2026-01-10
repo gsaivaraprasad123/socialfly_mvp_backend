@@ -50,6 +50,42 @@ export const createPost = async (req, res) => {
   }
 };
 
+export const getPosts = async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const result = await pool.query(
+      `
+      SELECT 
+        id,
+        caption,
+        media_url,
+        status,
+        publish_at,
+        published_at,
+        instagram_post_id,
+        error_message,
+        created_at,
+        updated_at
+      FROM posts
+      WHERE user_id = $1
+      ORDER BY created_at DESC
+      `,
+      [userId]
+    );
+
+    res.json({
+      posts: result.rows.map(post => ({
+        ...post,
+        mediaUrl: JSON.parse(post.media_url || '[]'),
+      })),
+    });
+  } catch (err) {
+    console.error('Get posts error:', err);
+    res.status(500).json({ error: 'Failed to fetch posts' });
+  }
+};
+
 export const publishNow = async (req, res) => {
   try {
     const { id } = req.params;
