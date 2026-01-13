@@ -1,26 +1,24 @@
-import axios from 'axios';
-import pool from '../config/database.js';
-import { decrypt } from '../utils/encryption.js';
+import axios from "axios";
+import pool from "../config/database.js";
+import { decrypt } from "../utils/encryption.js";
 
-const GRAPH_BASE = 'https://graph.facebook.com/v24.0';
+const GRAPH_BASE = "https://graph.facebook.com/v24.0";
 
 /**
- * Fetch IG business account + PAGE token
+ * Get IG account + page token
  */
 const getInstagramAccount = async (instagramAccountId) => {
   const res = await pool.query(
     `
-    SELECT
-      instagram_business_account_id,
-      page_access_token_encrypted
+    SELECT instagram_business_account_id, page_access_token_encrypted
     FROM instagram_accounts
     WHERE id = $1
     `,
     [instagramAccountId]
   );
 
-  if (res.rows.length === 0) {
-    throw new Error('Instagram account not found');
+  if (!res.rows.length) {
+    throw new Error("Instagram account not found");
   }
 
   return {
@@ -30,59 +28,75 @@ const getInstagramAccount = async (instagramAccountId) => {
 };
 
 /**
- * Create media container (image or video)
+ * Create media container (IMAGE / VIDEO)
  */
 const createMediaContainer = async ({
   igId,
   pageToken,
   mediaUrl,
   caption,
-  mediaType = 'IMAGE',
+  mediaType = "IMAGE",
   isCarouselItem = false,
   altText,
 }) => {
   const payload = {
-    access_token: pageToken,
-    caption,
     is_carousel_item: isCarouselItem || undefined,
   };
 
-  if (mediaType === 'IMAGE') {
+  if (caption) payload.caption = caption;
+
+  if (mediaType === "IMAGE") {
     payload.image_url = mediaUrl;
     if (altText) payload.alt_text = altText;
   } else {
     payload.video_url = mediaUrl;
-    payload.media_type = mediaType; // VIDEO | REELS | STORIES
+    payload.media_type = mediaType;
   }
 
   const res = await axios.post(
     `${GRAPH_BASE}/${igId}/media`,
-    payload
+    payload,
+    {
+      headers: { Authorization: `Bearer ${pageToken}` },
+    }
   );
 
   return res.data.id;
 };
 
 /**
- * Create carousel container
+ * ⏳ WAIT until container is ready
  */
-const createCarouselContainer = async ({
-  igId,
+const waitForContainerReady = async ({
+  containerId,
   pageToken,
-  caption,
-  childrenIds,
+  maxRetries = 10,
+  delayMs = 5000,
 }) => {
-  const res = await axios.post(
-    `${GRAPH_BASE}/${igId}/media`,
-    {
-      media_type: 'CAROUSEL',
-      caption,
-      children: childrenIds.join(','),
-      access_token: pageToken,
-    }
-  );
+  for (let i = 0; i < maxRetries; i++) {
+    const res = await axios.get(
+      `${GRAPH_BASE}/${containerId}`,
+      {
+        params: { fields: "status_code" },
+        headers: { Authorization: `Bearer ${pageToken}` },
+      }
+    );
 
-  return res.data.id;
+    const status = res.data.status_code;
+
+    if (status === "FINISHED") {
+      return;
+    }
+
+    if (status === "ERROR" || status === "EXPIRED") {
+      throw new Error(`Media container failed: ${status}`);
+    }
+
+    // IN_PROGRESS → wait
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+
+  throw new Error("Media processing timeout");
 };
 
 /**
@@ -91,9 +105,9 @@ const createCarouselContainer = async ({
 const publishContainer = async ({ igId, pageToken, containerId }) => {
   const res = await axios.post(
     `${GRAPH_BASE}/${igId}/media_publish`,
+    { creation_id: containerId },
     {
-      creation_id: containerId,
-      access_token: pageToken,
+      headers: { Authorization: `Bearer ${pageToken}` },
     }
   );
 
@@ -101,7 +115,7 @@ const publishContainer = async ({ igId, pageToken, containerId }) => {
 };
 
 /**
- * PUBLIC: Publish Post (used by controller + cron)
+ * 🚀 PUBLIC: Publish Post
  */
 export const publishPost = async (
   instagramAccountId,
@@ -112,33 +126,27 @@ export const publishPost = async (
   const { igId, pageToken } =
     await getInstagramAccount(instagramAccountId);
 
-  // Rate-limit check (optional but recommended)
-  const limitRes = await axios.get(
-    `${GRAPH_BASE}/${igId}/content_publishing_limit`,
-    { params: { access_token: pageToken } }
-  );
-
-  if (limitRes.data.data?.[0]?.quota_usage >= 100) {
-    throw new Error('Instagram publishing rate limit exceeded');
-  }
-
   let containerId;
 
-  // SINGLE IMAGE / VIDEO
+  /**
+   * SINGLE IMAGE / VIDEO
+   */
   if (!Array.isArray(mediaUrl)) {
     containerId = await createMediaContainer({
       igId,
       pageToken,
       mediaUrl,
       caption,
-      mediaType: options.mediaType || 'IMAGE',
+      mediaType: options.mediaType || "IMAGE",
       altText: options.altText,
     });
   }
-  // CAROUSEL
+  /**
+   * CAROUSEL
+   */
   else {
-    if (mediaUrl.length > 10) {
-      throw new Error('Carousel supports max 10 items');
+    if (mediaUrl.length < 2) {
+      throw new Error("Carousel requires at least 2 media URLs");
     }
 
     const childContainers = [];
@@ -147,21 +155,37 @@ export const publishPost = async (
         igId,
         pageToken,
         mediaUrl: url,
-        caption: null,
         isCarouselItem: true,
       });
       childContainers.push(childId);
     }
 
-    containerId = await createCarouselContainer({
-      igId,
-      pageToken,
-      caption,
-      childrenIds: childContainers,
-    });
+    const carouselRes = await axios.post(
+      `${GRAPH_BASE}/${igId}/media`,
+      {
+        media_type: "CAROUSEL",
+        caption,
+        children: childContainers.join(","),
+      },
+      {
+        headers: { Authorization: `Bearer ${pageToken}` },
+      }
+    );
+
+    containerId = carouselRes.data.id;
   }
 
-  // Publish
+  /**
+   * ⏳ WAIT until media is READY
+   */
+  await waitForContainerReady({
+    containerId,
+    pageToken,
+  });
+
+  /**
+   * 🚀 PUBLISH
+   */
   return await publishContainer({
     igId,
     pageToken,
