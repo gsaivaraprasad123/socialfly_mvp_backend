@@ -4,9 +4,7 @@ import { decrypt } from "../utils/encryption.js";
 
 const GRAPH_BASE = "https://graph.facebook.com/v24.0";
 
-/**
- * Get IG account + page token
- */
+// GET IG ACCOUNT + PAGE TOKEN
 const getInstagramAccount = async (instagramAccountId) => {
   const res = await pool.query(
     `
@@ -27,9 +25,7 @@ const getInstagramAccount = async (instagramAccountId) => {
   };
 };
 
-/**
- * Create media container (IMAGE / VIDEO)
- */
+// CREATE MEDIA CONTAINER (IMAGE / VIDEO)
 const createMediaContainer = async ({
   igId,
   pageToken,
@@ -64,9 +60,7 @@ const createMediaContainer = async ({
   return res.data.id;
 };
 
-/**
- * ⏳ WAIT until container is ready
- */
+// WAIT UNTIL CONTAINER IS READY
 const waitForContainerReady = async ({
   containerId,
   pageToken,
@@ -99,9 +93,7 @@ const waitForContainerReady = async ({
   throw new Error("Media processing timeout");
 };
 
-/**
- * Publish container
- */
+// PUBLISH CONTAINER
 const publishContainer = async ({ igId, pageToken, containerId }) => {
   const res = await axios.post(
     `${GRAPH_BASE}/${igId}/media_publish`,
@@ -114,81 +106,91 @@ const publishContainer = async ({ igId, pageToken, containerId }) => {
   return res.data.id;
 };
 
-/**
- * 🚀 PUBLIC: Publish Post
- */
+// PUBLISH POST
 export const publishPost = async (
   instagramAccountId,
-  mediaUrl,
+  mediaUrls,
   caption,
   options = {}
 ) => {
+  const {
+    mediaType = 'IMAGE',
+    altText = null,
+  } = options;
+
   const { igId, pageToken } =
     await getInstagramAccount(instagramAccountId);
 
   let containerId;
 
-  /**
-   * SINGLE IMAGE / VIDEO
-   */
-  if (!Array.isArray(mediaUrl)) {
-    containerId = await createMediaContainer({
-      igId,
-      pageToken,
-      mediaUrl,
-      caption,
-      mediaType: options.mediaType || "IMAGE",
-      altText: options.altText,
-    });
+  // SINGLE IMAGE / VIDEO / REEL / STORY
+  if (mediaType !== 'CAROUSEL') {
+    const payload = { caption };
+
+    if (mediaType === 'IMAGE') {
+      payload.image_url = mediaUrls[0];
+      if (altText) payload.alt_text = altText;
+    } else {
+      payload.video_url = mediaUrls[0];
+      payload.media_type = mediaType; // VIDEO | REELS | STORIES
+    }
+
+    const res = await axios.post(
+      `${GRAPH_BASE}/${igId}/media`,
+      payload,
+      {
+        headers: { Authorization: `Bearer ${pageToken}` },
+      }
+    );
+
+    containerId = res.data.id;
   }
-  /**
-   * CAROUSEL
-   */
+
+  // CAROUSEL
   else {
-    if (mediaUrl.length < 2) {
-      throw new Error("Carousel requires at least 2 media URLs");
+    const children = [];
+
+    for (const url of mediaUrls) {
+      const child = await axios.post(
+        `${GRAPH_BASE}/${igId}/media`,
+        {
+          image_url: url,
+          is_carousel_item: true,
+        },
+        {
+          headers: { Authorization: `Bearer ${pageToken}` },
+        }
+      );
+      children.push(child.data.id);
     }
 
-    const childContainers = [];
-    for (const url of mediaUrl) {
-      const childId = await createMediaContainer({
-        igId,
-        pageToken,
-        mediaUrl: url,
-        isCarouselItem: true,
-      });
-      childContainers.push(childId);
-    }
-
-    const carouselRes = await axios.post(
+    const carousel = await axios.post(
       `${GRAPH_BASE}/${igId}/media`,
       {
-        media_type: "CAROUSEL",
+        media_type: 'CAROUSEL',
         caption,
-        children: childContainers.join(","),
+        children: children.join(','),
       },
       {
         headers: { Authorization: `Bearer ${pageToken}` },
       }
     );
 
-    containerId = carouselRes.data.id;
+    containerId = carousel.data.id;
   }
 
-  /**
-   * ⏳ WAIT until media is READY
-   */
-  await waitForContainerReady({
-    containerId,
-    pageToken,
-  });
+  // WAIT UNTIL CONTAINER IS READY
+  await waitForContainerReady({ containerId, pageToken });
 
-  /**
-   * 🚀 PUBLISH
-   */
-  return await publishContainer({
-    igId,
-    pageToken,
-    containerId,
-  });
+  // PUBLISH
+  const publish = await axios.post(
+    `${GRAPH_BASE}/${igId}/media_publish`,
+    { creation_id: containerId },
+    {
+      headers: { Authorization: `Bearer ${pageToken}` },
+    }
+  );
+
+  return publish.data.id;
 };
+

@@ -2,75 +2,82 @@ import pool from "../config/database.js";
 import { POST_STATUS } from "../config/constants.js";
 import { publishPost } from "../services/instagramService.js";
 
-/**
- * CREATE POST (DRAFT / SCHEDULED)
- */
+// CREATE POST 
 export const createPost = async (req, res) => {
   try {
-    const { caption, mediaUrl, publishAt } = req.body;
+    if (!req.body) {
+      return res.status(400).json({
+        error: 'Request body missing (check Content-Type: application/json)',
+      });
+    }
+    
+    const { caption, mediaUrls, mediaType, altText, publishAt } = req.body;
     const userId = req.user.id;
 
-    if (!mediaUrl) {
-      return res.status(400).json({ error: "Media URL is required" });
+    if (!mediaUrls || !Array.isArray(mediaUrls) || mediaUrls.length === 0) {
+      return res.status(400).json({ error: 'mediaUrls required' });
     }
 
-    // ❗ Prevent invalid carousel
-    if (Array.isArray(mediaUrl) && mediaUrl.length < 2) {
+    // Validation
+    if (mediaType === 'CAROUSEL' && mediaUrls.length < 2) {
       return res.status(400).json({
-        error: "Carousel requires at least 2 media URLs",
+        error: 'Carousel requires at least 2 media URLs',
       });
     }
 
-    // Fetch connected Instagram account
+    if (mediaType !== 'CAROUSEL' && mediaUrls.length !== 1) {
+      return res.status(400).json({
+        error: `${mediaType} requires exactly one media URL`,
+      });
+    }
+
     const account = await pool.query(
-      "SELECT id FROM instagram_accounts WHERE user_id = $1 LIMIT 1",
+      'SELECT id FROM instagram_accounts WHERE user_id = $1 LIMIT 1',
       [userId]
     );
 
     if (!account.rows.length) {
-      return res.status(400).json({
-        error: "No Instagram account connected",
-      });
+      return res.status(400).json({ error: 'No Instagram account connected' });
     }
 
-    const status = publishAt
-      ? POST_STATUS.SCHEDULED
-      : POST_STATUS.DRAFT;
+    const status = publishAt ? POST_STATUS.SCHEDULED : POST_STATUS.DRAFT;
 
-    // ✅ CAPTURE QUERY RESULT
     const result = await pool.query(
       `
       INSERT INTO posts
-        (user_id, instagram_account_id, caption, media_url, status, publish_at)
-      VALUES ($1,$2,$3,$4,$5,$6)
+      (
+        user_id,
+        instagram_account_id,
+        caption,
+        media_url,
+        media_type,
+        alt_text,
+        status,
+        publish_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
       RETURNING *
       `,
       [
         userId,
         account.rows[0].id,
         caption || null,
-        JSON.stringify(mediaUrl), // string OR array
+        JSON.stringify(mediaUrls),
+        mediaType || 'IMAGE',
+        altText || null,
         status,
         publishAt || null,
       ]
     );
 
-    return res.status(201).json({
-      post: result.rows[0],
-    });
+    res.status(201).json({ post: result.rows[0] });
   } catch (err) {
-    console.error("Create post error:", err);
-    return res.status(500).json({
-      error: "Create post failed",
-    });
+    console.error('Create post error:', err);
+    res.status(500).json({ error: 'Create post failed' });
   }
 };
 
-
-
-/**
- * GET POSTS
- */
+// GET POSTS
 export const getPosts = async (req, res) => {
   try {
     const userId = req.user.id;
@@ -97,9 +104,7 @@ export const getPosts = async (req, res) => {
   }
 };
 
-/**
- * PUBLISH NOW
- */
+// PUBLISH NOW
 export const publishNow = async (req, res) => {
   const { id } = req.params;
   const userId = req.user.id;
@@ -131,11 +136,16 @@ export const publishNow = async (req, res) => {
         ? parsedMedia[0]
         : parsedMedia;
 
-    const instagramPostId = await publishPost(
-      post.instagram_account_id,
-      mediaToPublish,
-      post.caption
-    );
+        const instagramPostId = await publishPost(
+          post.instagram_account_id,
+          parsedMedia,
+          post.caption,
+          {
+            mediaType: post.media_type,  
+            altText: post.alt_text,
+          }
+        );
+        
 
     await pool.query(
       `

@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS posts (
   instagram_account_id INTEGER REFERENCES instagram_accounts(id) ON DELETE SET NULL,
   caption TEXT,
   media_url TEXT NOT NULL,
+  media_type VARCHAR(20),        
+  alt_text TEXT,                
   status VARCHAR(20) NOT NULL DEFAULT 'DRAFT',
   publish_at TIMESTAMP,
   published_at TIMESTAMP,
