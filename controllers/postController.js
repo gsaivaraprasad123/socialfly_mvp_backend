@@ -14,6 +14,13 @@ export const createPost = async (req, res) => {
       return res.status(400).json({ error: "Media URL is required" });
     }
 
+    // ❗ Prevent invalid carousel
+    if (Array.isArray(mediaUrl) && mediaUrl.length < 2) {
+      return res.status(400).json({
+        error: "Carousel requires at least 2 media URLs",
+      });
+    }
+
     // Fetch connected Instagram account
     const account = await pool.query(
       "SELECT id FROM instagram_accounts WHERE user_id = $1 LIMIT 1",
@@ -21,23 +28,16 @@ export const createPost = async (req, res) => {
     );
 
     if (!account.rows.length) {
-      return res.status(400).json({ error: "No Instagram account connected" });
+      return res.status(400).json({
+        error: "No Instagram account connected",
+      });
     }
 
-    const status = publishAt ? POST_STATUS.SCHEDULED : POST_STATUS.DRAFT;
+    const status = publishAt
+      ? POST_STATUS.SCHEDULED
+      : POST_STATUS.DRAFT;
 
-    /**
-     * IMPORTANT:
-     * - Single image → store STRING
-     * - Carousel → store ARRAY
-     */
-    const normalizedMedia =
-      Array.isArray(mediaUrl) && mediaUrl.length > 1
-        ? mediaUrl
-        : Array.isArray(mediaUrl)
-        ? mediaUrl[0]
-        : mediaUrl;
-
+    // ✅ CAPTURE QUERY RESULT
     const result = await pool.query(
       `
       INSERT INTO posts
@@ -49,18 +49,24 @@ export const createPost = async (req, res) => {
         userId,
         account.rows[0].id,
         caption || null,
-        JSON.stringify(normalizedMedia),
+        JSON.stringify(mediaUrl), // string OR array
         status,
         publishAt || null,
       ]
     );
 
-    res.status(201).json({ post: result.rows[0] });
+    return res.status(201).json({
+      post: result.rows[0],
+    });
   } catch (err) {
     console.error("Create post error:", err);
-    res.status(500).json({ error: "Create post failed" });
+    return res.status(500).json({
+      error: "Create post failed",
+    });
   }
 };
+
+
 
 /**
  * GET POSTS
