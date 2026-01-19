@@ -24,6 +24,7 @@ export const connect = async (req, res) => {
         "instagram_manage_insights",
         "pages_show_list",
         "pages_read_engagement",
+        "business_management",
       ].join(","),
 
       extras: JSON.stringify({
@@ -57,17 +58,17 @@ export const callback = async (req, res) => {
     const userId = Number(state);
 
     if (!access_token || !userId) {
-      return res.status(400).json({ error: "Missing token or state" });
+      return res.status(400).json({ error: 'Missing token or state' });
     }
 
     /**
-     * STEP 1 — Exchange short → long-lived USER token
+     * STEP 1 — Exchange SHORT → LONG-LIVED USER TOKEN
      */
     const longTokenRes = await axios.get(
       `${GRAPH_BASE}/oauth/access_token`,
       {
         params: {
-          grant_type: "fb_exchange_token",
+          grant_type: 'fb_exchange_token',
           client_id: process.env.FACEBOOK_APP_ID,
           client_secret: process.env.FACEBOOK_APP_SECRET,
           fb_exchange_token: access_token,
@@ -80,42 +81,45 @@ export const callback = async (req, res) => {
     const expiresAt = new Date(Date.now() + expiresIn * 1000);
 
     /**
-     * STEP 2 — Validate user identity
+     * STEP 2 — Fetch Facebook Pages the user manages
      */
-    const meRes = await axios.get(`${GRAPH_BASE}/me`, {
-      params: { access_token: longLivedUserToken },
-    });
-
-    const facebookUserId = meRes.data.id;
-
-    /**
-     * STEP 3 — Fetch Page directly (DO NOT use /me/accounts)
-     */
-    const pageId = process.env.FACEBOOK_PAGE_ID;
-
-    const pageRes = await axios.get(
-      `${GRAPH_BASE}/${pageId}`,
+    const pagesRes = await axios.get(
+      `${GRAPH_BASE}/me/accounts`,
       {
         params: {
-          fields: "id,name,access_token,instagram_business_account",
+          fields: 'id,name,access_token,instagram_business_account',
           access_token: longLivedUserToken,
         },
       }
     );
 
-    const page = pageRes.data;
+    const pages = pagesRes.data?.data || [];
 
-    if (!page.instagram_business_account?.id) {
+    if (!pages.length) {
       return res.status(400).json({
-        error: "No Instagram Business Account linked to this Page",
+        error: 'No Facebook Pages found for this user',
       });
     }
 
-    const igBusinessId = page.instagram_business_account.id;
-    const pageAccessToken = page.access_token;
+    /**
+     * STEP 3 — Find Page linked to Instagram Business Account
+     */
+    const pageWithInstagram = pages.find(
+      (p) => p.instagram_business_account?.id
+    );
+
+    if (!pageWithInstagram) {
+      return res.status(400).json({
+        error: 'No Instagram Business Account linked to any Page',
+      });
+    }
+
+    const igBusinessId =
+      pageWithInstagram.instagram_business_account.id;
+    const pageAccessToken = pageWithInstagram.access_token;
 
     /**
-     * STEP 4 — UPSERT into DB
+     * STEP 4 — UPSERT INTO DATABASE
      */
     await pool.query(
       `
@@ -143,19 +147,28 @@ export const callback = async (req, res) => {
       ]
     );
 
+    /**
+     * STEP 5 — SUCCESS RESPONSE
+     */
     return res.json({
-      message: "Instagram Business account connected successfully",
-      facebookUserId,
-      pageId: page.id,
-      pageName: page.name,
+      message: 'Instagram Business account connected successfully',
+      pageId: pageWithInstagram.id,
+      pageName: pageWithInstagram.name,
       instagramBusinessAccountId: igBusinessId,
       tokenExpiresAt: expiresAt,
     });
   } catch (err) {
-    console.error("Instagram callback error:", err.response?.data || err);
-    return res.status(500).json({ error: "Instagram onboarding failed" });
+    console.error(
+      'Instagram callback error:',
+      err.response?.data || err
+    );
+
+    return res.status(500).json({
+      error: 'Instagram onboarding failed',
+    });
   }
 };
+
 
 
 
