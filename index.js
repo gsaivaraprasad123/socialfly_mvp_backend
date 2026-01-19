@@ -9,6 +9,7 @@ import { startScheduler } from "./services/schedulerService.js";
 import authRoutes from "./routes/authRoutes.js";
 import instagramRoutes from "./routes/instagramRoutes.js";
 import postRoutes from "./routes/postRoutes.js";
+import threadsPostRoutes from "./routes/threadsPostRoutes.js";
 
 dotenv.config();
 
@@ -32,6 +33,7 @@ app.get("/health", (req, res) => {
 app.use("/auth", authRoutes);
 app.use("/instagram", instagramRoutes);
 app.use("/posts", postRoutes);
+app.use("/threads", threadsPostRoutes); // Threads routes
 
 // Initialize database and start server
 const startServer = async () => {
